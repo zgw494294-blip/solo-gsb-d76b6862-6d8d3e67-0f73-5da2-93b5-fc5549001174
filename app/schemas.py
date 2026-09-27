@@ -6,6 +6,7 @@ from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
+from .dns01 import normalize_owner_name
 from .engine import normalize_name
 
 ALLOWED_FLAGS = (0, 128)
@@ -424,6 +425,171 @@ class CheckCSRResponse(BaseModel):
     reason: str
     identifiers: list[CSRIdentifierResult] = Field(
         ..., description="Per-identifier results in SAN input order"
+    )
+
+
+class RSAJWK(BaseModel):
+    """Public RSA JWK used as the ACME account key.
+
+    Extra members (``kid``, ``alg``, ...) are accepted but ignored: the
+    RFC 7638 thumbprint only covers the required ``e``/``kty``/``n``
+    members, whose values are validated by the DNS-01 checker.
+    """
+
+    kty: str = Field(..., description="Key type; must be 'RSA'")
+    n: str = Field(..., description="Modulus, unpadded base64url")
+    e: str = Field(..., description="Public exponent, unpadded base64url")
+
+
+class DNS01TXTRecord(BaseModel):
+    """A single TXT record: ordered character-string chunks."""
+
+    type: Literal["TXT"]
+    owner: str = Field(
+        ..., min_length=1, description="Record owner name ('_' labels allowed)"
+    )
+    chunks: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Ordered TXT character-strings; concatenated per record "
+        "before comparison",
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _norm_owner(cls, v: str) -> str:
+        return normalize_owner_name(v, field="owner")
+
+
+class DNS01CNAMERecord(BaseModel):
+    """A single CNAME record in the DNS-01 offline view."""
+
+    type: Literal["CNAME"]
+    owner: str = Field(
+        ..., min_length=1, description="Record owner name ('_' labels allowed)"
+    )
+    target: str = Field(..., min_length=1, description="CNAME target name")
+
+    @field_validator("owner")
+    @classmethod
+    def _norm_owner(cls, v: str) -> str:
+        return normalize_owner_name(v, field="owner")
+
+    @field_validator("target")
+    @classmethod
+    def _norm_target(cls, v: str) -> str:
+        return normalize_owner_name(v, field="target")
+
+
+DNS01Record = Union[DNS01TXTRecord, DNS01CNAMERecord]
+
+
+class DNS01Challenge(BaseModel):
+    """One ACME dns-01 challenge to verify offline."""
+
+    id: str = Field(..., min_length=1, description="Caller-chosen unique challenge id")
+    domain: str = Field(
+        ..., description="Base domain name (no '*.' wildcard marker)"
+    )
+    wildcard: StrictBool = Field(
+        False, description="Whether a wildcard certificate is requested"
+    )
+    token: str = Field(
+        ..., min_length=1, description="ACME token, unpadded base64url"
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _non_blank_id(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("id must not be blank")
+        return v
+
+    @field_validator("domain")
+    @classmethod
+    def _norm_domain(cls, v: str) -> str:
+        return normalize_name(v, field="domain")
+
+
+class CheckDNS01Request(BaseModel):
+    """Offline verification of ACME dns-01 challenges."""
+
+    jwk: RSAJWK = Field(..., description="ACME account key as a public RSA JWK")
+    challenges: list[DNS01Challenge] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="1-20 challenges with unique ids, verified in input order",
+    )
+    records: list[DNS01Record] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Up to 100 TXT/CNAME records used as the offline DNS view",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "CheckDNS01Request":
+        ids = [c.id for c in self.challenges]
+        if len(set(ids)) != len(ids):
+            raise ValueError("challenge ids must be unique")
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "jwk": {
+                        "kty": "RSA",
+                        "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+                        "e": "AQAB",
+                    },
+                    "challenges": [
+                        {
+                            "id": "ch-www",
+                            "domain": "www.example.com",
+                            "wildcard": False,
+                            "token": "dpN98kgNPJXQjTzeOaRqQhM1d8v-7QdVwQ6q7iVj5_k",
+                        }
+                    ],
+                    "records": [
+                        {
+                            "type": "TXT",
+                            "owner": "_acme-challenge.www.example.com",
+                            "chunks": ["d1VLn3u-fHWHtPZd-imu5yU-PEkUzMXUBxLhgMGfrsE"],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class DNS01ChallengeResult(BaseModel):
+    """Verification outcome for one challenge, in challenge input order."""
+
+    id: str
+    domain: str = Field(..., description="Normalized base domain name")
+    wildcard: bool
+    lookup: str = Field(
+        ..., description="Name actually queried: _acme-challenge.<domain>"
+    )
+    expected_value: str = Field(
+        ..., description="Expected TXT value: base64url(SHA-256(token.thumbprint))"
+    )
+    valid: bool
+    reason: str
+
+
+class CheckDNS01Response(BaseModel):
+    valid: bool = Field(
+        ..., description="True only when every challenge is satisfied"
+    )
+    thumbprint: str = Field(
+        ..., description="RFC 7638 SHA-256 JWK thumbprint, unpadded base64url"
+    )
+    reason: str
+    challenges: list[DNS01ChallengeResult] = Field(
+        ..., description="Per-challenge results in challenge input order"
     )
 
 
