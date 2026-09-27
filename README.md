@@ -8,6 +8,11 @@
 `POST /v1/issuance/check-csr` 接收一份不超过 64 KiB 的 PEM PKCS#10 CSR：用 `cryptography` 校验
 CSR 签名后，**仅从 subjectAltName 提取 1～20 个 dNSName**（缺失 SAN 或含其他标识均拒绝，绝不以
 CN 兜底），按 SAN 顺序逐个套用同一套 CAA 判定并共享一次记录准备，任一标识未获授权则整份 CSR 不可受理。
+`POST /v1/issuance/check-dns01` 离线核验 ACME **DNS-01** 挑战（RFC 8555 §8.4）：输入一个 RSA JWK、
+1～20 个带唯一 id 的挑战（domain、wildcard、无填充 base64url token）与最多 100 条 TXT/CNAME，
+按 RFC 7638 计算 JWK thumbprint，在精确名 `_acme-challenge.<domain>` 上（通配符与普通挑战同名、
+domain 不含 `*`）比较 `base64url(SHA-256(token.thumbprint))`；TXT 的 chunks 按序拼接逐 RR 比对，
+CNAME 仅精确跟随、不上溯、限 8 跳、成环即拒。
 `POST /v1/authorize/change-impact` 可提交一批删除 / 新增编辑，审查它们会翻转哪些查询的签发许可，
 并为每个翻转给出可重现新版判定的最小编辑子集。
 `POST /v1/records/minimize` 则只删不增：在保持所有提交查询的 `authorized` 与 `effective_owner`
@@ -523,6 +528,105 @@ jq -n --rawfile csr /tmp/csr.pem \
 SAN 含 IP 地址、缺少 SAN（只有 CN）、DNSName 超 20 个、名称非法或规范化后重名同样返回 422；
 任一标识查找时命中 CNAME 成环则返回 `error_type=CNAMELoopError`。
 
+### `POST /v1/issuance/check-dns01`
+
+**离线**核验一批 ACME DNS-01 挑战（RFC 8555 §8.4）：调用方自带 TXT/CNAME 记录集，
+服务**不发起任何真实 DNS 查询**。
+
+请求体：
+
+| 字段         | 类型             | 必填 | 说明                                                          |
+| ------------ | ---------------- | ---- | ------------------------------------------------------------- |
+| `jwk`        | object           | 是   | ACME 账户的 RSA 公钥 JWK：`kty`（必须为 `"RSA"`）、`n`、`e`   |
+| `challenges` | array 1～20 项   | 是   | 待核验挑战，`id` 必须唯一                                     |
+| `records`    | array ≤ 100 条   | 否   | 离线 DNS 视角，元素为 TXT 或 CNAME 记录                       |
+
+挑战项：`{"id":"...","domain":"example.com","wildcard":false,"token":"..."}`
+
+- `domain` 是**不含 `*`** 的域名（忽略大小写与单个尾点）；`wildcard=true` 只表示该挑战对应
+  `*.example.com`，**两类挑战查询的 owner 完全相同**，都是 `_acme-challenge.example.com`。
+- `token` 必须是**非空、无填充 base64url**（字符集 `A-Za-z0-9_-`、不含 `=`、长度合法）。
+
+TXT 记录：`{"type":"TXT","owner":"_acme-challenge.example.com","chunks":["<分片1>","<分片2>"]}`
+
+CNAME 记录：`{"type":"CNAME","owner":"...","target":"..."}`（owner/target 允许下划线标签）
+
+期望摘要计算：
+
+1. **JWK thumbprint（RFC 7638）**：取 JWK 的 `e`/`kty`/`n` 三个成员（原始 base64url 字符串），
+   按键名字典序组成无空白的 JSON（如 `{"e":"AQAB","kty":"RSA","n":"..."}`），
+   对其 UTF-8 字节求 SHA-256，再做**无填充 base64url**；JWK 中额外的 `alg`/`kid` 等成员忽略。
+2. **key authorization**：`token + "." + thumbprint`。
+3. **期望 TXT 值**：无填充 `base64url(SHA-256(key authorization))`。
+
+记录与查找规则：
+
+1. **JWK 校验（422，`error_type=InvalidJWKError`）**：`kty` 必须恰好是 `"RSA"`；`n`/`e` 必须是
+   非空、无填充、规范的 base64url，解码为正整数且**无前导零字节**（RFC 7518），且均为奇数、
+   `e ≥ 3`；缺字段或类型错误同样拒绝。
+2. **名称 / token / 批量校验（422）**：域名非法（空标签、通配符 `*`、非法字符、以 `-` 开头/结尾等）、
+   token 不是合法无填充 base64url（`error_type=InvalidTokenError`）、挑战数超出 1～20、id 空白或重名、
+   记录数超过 100，均拒绝整个请求。
+3. **记录集校验（422）**：同一 owner 同时存在 TXT 与 CNAME（`MixedRecordsError`）、
+   同一 owner 多条 CNAME（`MultipleCNAMEError`）均拒绝。
+4. **精确查找，绝不上溯**：每个挑战只查 `_acme-challenge.<domain>` 这一个名字；跟随 CNAME 后只在
+   **目标名本身**查 TXT，不查询任何父级（CNAME 目标链与父级域均不查询）。
+5. **CNAME 限制（422）**：仅按精确名跟随别名，最多 **8 跳**（`CNAMELimitError`）；
+   任何名字被重复访问即视为成环，含自指（`CNAMELoopError`）。别名错误使**整个请求**返回 422，
+   不按单项失败处理。
+6. **TXT 比对**：同一 owner 的多条 TXT RR 全部保留；每条 RR 的 `chunks` 是 DNS 线上一条字符串的
+   **有序分片**，按数组顺序**直接拼接**（不加分隔符）后作为该 RR 的值；任一 RR 的拼接值与期望摘要
+   **完全相等**即该项通过。
+7. **单项失败而非请求失败**：解析正常但查不到 TXT、或所有 TXT RR 均不匹配时，**仅该挑战项
+   `valid=false`**（响应给出 `expected_txt` 与全部 `observed_txt`），其余挑战照常核验，不短路。
+
+响应体：
+
+| 字段                          | 说明                                                       |
+| ----------------------------- | ---------------------------------------------------------- |
+| `thumbprint`                  | RFC 7638 JWK thumbprint（无填充 base64url）                |
+| `valid`                       | 整体结果：所有挑战项通过才为 `true`                        |
+| `reason`                      | 人读整体结论（含失败项 id 列表）                           |
+| `results`                     | 各挑战结果，按**输入顺序**                                 |
+| `results[].id` / `.domain`    | 挑战 id 与规范化后的 domain（不含 `*`）                    |
+| `results[].wildcard`          | 是否为通配符挑战（不影响查询名）                           |
+| `results[].qname`             | 实际查询的精确名 `_acme-challenge.<domain>`                |
+| `results[].valid`             | 该挑战是否核验通过                                         |
+| `results[].cname_hops`        | 跟随的 CNAME 跳数（0～8）                                  |
+| `results[].cname_chain`       | 精确名 CNAME 链（从 qname 开始）                           |
+| `results[].txt_owner`         | 实际比对 TXT 的 owner（CNAME 终名）                        |
+| `results[].expected_txt`      | 期望摘要                                                   |
+| `results[].observed_txt`      | `txt_owner` 上每条 TXT RR 按序拼接后的值                   |
+| `results[].reason`            | 该挑战的人读结论                                           |
+
+请求与响应示例（JWK 取自 RFC 7638 附录 A.1，thumbprint 固定为
+`NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs`）：
+
+```bash
+curl -s -X POST http://localhost:8080/v1/issuance/check-dns01 \
+  -H 'Content-Type: application/json' -d '{
+    "jwk": {"kty":"RSA",
+      "n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+      "e":"AQAB"},
+    "challenges": [
+      {"id":"ch1","domain":"example.com","wildcard":false,"token":"DGyRejmCefe7v4NfDGDKfA"},
+      {"id":"ch2","domain":"www.example.com","wildcard":true,"token":"aaaaaaaaaaaa"}
+    ],
+    "records": [
+      {"type":"TXT","owner":"_acme-challenge.example.com",
+       "chunks":["Bs72Q7B-BSSQo4oDjA2qBR07GB6sc3hiG9zqaqvHx7U"]},
+      {"type":"CNAME","owner":"_acme-challenge.www.example.com",
+       "target":"challenge.cdn.example.net"},
+      {"type":"TXT","owner":"challenge.cdn.example.net",
+       "chunks":["<base64url(SHA-256(aaaaaaaaaaaa.thumbprint))>"]}
+    ]
+  }'
+```
+
+错误请求示例：`n` 带 `=` 填充 → HTTP 422，`{"detail":"jwk.n must be unpadded base64url",
+"error_type":"InvalidJWKError"}`；token 非法、domain 含 `*`、id 重复、同名 TXT/CNAME、多条 CNAME、
+CNAME 成环或超过 8 跳同样返回 422；TXT 缺失 / 不匹配则 HTTP 200 且对应项 `valid=false`。
+
 ### `POST /v1/records/import-zone`
 
 把一段 BIND zone 文本解析成**可直接作为 `/v1/authorize` 的 `records` 使用**的 CAA/CNAME
@@ -888,12 +992,15 @@ app/
   engine.py     # 记录准备（prepare_records → 不可变索引）与查询判定（evaluate_prepared）分离；
               # 规范化、逐级上溯、CNAME 链、判定规则（纯逻辑，无 I/O）
   csr.py        # PKCS#10 CSR 解析、签名校验与 SAN DNSName 提取（cryptography）
+  dns01.py      # ACME DNS-01 离线核验：RSA JWK 校验、RFC 7638 thumbprint、
+              # TXT chunks 按序拼接比对、精确名 CNAME 链（8 跳 / 成环，不上溯）
   zonefile.py   # BIND zone 文本解析与导出（$ORIGIN/$TTL、owner 继承、括号/引号/转义）
   schemas.py    # Pydantic v2 请求/响应模型与输入校验
   main.py       # FastAPI 路由与 422 异常映射
 tests/
   test_api.py             # 48 条 authorize / patch-plan 端到端用例
   test_check_csr.py       # 41 条 CSR 受理检查（check-csr）用例
+  test_check_dns01.py     # 60 条 ACME DNS-01 离线核验（check-dns01）用例
   test_change_impact.py   # 28 条变更影响审查（change-impact）用例
   test_export_zone.py     # 26 条 zone 导出（export-zone）用例
   test_issuance_route.py  # 24 条批量签发路由用例（pytest + TestClient）

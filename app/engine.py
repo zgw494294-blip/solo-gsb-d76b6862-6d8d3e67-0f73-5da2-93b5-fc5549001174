@@ -113,12 +113,17 @@ class TraceStep:
         }
 
 
-def normalize_name(raw: str, *, field: str = "name") -> str:
+def normalize_name(
+    raw: str, *, field: str = "name", allow_underscore: bool = False
+) -> str:
     """Lower-case a DNS name, strip a single trailing dot and validate it.
 
     Empty labels, labels longer than 63 octets, invalid characters and
     overall length above 253 octets are rejected. Wildcards ("*") are not
-    accepted here.
+    accepted here. Underscores are rejected like every other non-LDH
+    character by default; ``allow_underscore`` admits them (DNS-01 owners
+    such as ``_acme-challenge.example.com`` and alias targets legitimately
+    carry underscore labels).
     """
     if not isinstance(raw, str):
         raise InvalidNameError(f"{field} must be a string")
@@ -141,7 +146,10 @@ def normalize_name(raw: str, *, field: str = "name") -> str:
             raise InvalidNameError(
                 f"invalid {field} {raw!r}: label must not start/end with '-'"
             )
-        if not all(c.isascii() and (c.isalnum() or c == "-") for c in label):
+        if not all(
+            c.isascii() and (c.isalnum() or c == "-" or (allow_underscore and c == "_"))
+            for c in label
+        ):
             raise InvalidNameError(
                 f"invalid {field} {raw!r}: illegal character in label"
             )

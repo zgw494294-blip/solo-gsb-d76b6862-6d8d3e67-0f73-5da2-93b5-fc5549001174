@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
 
 from .engine import normalize_name
 
@@ -425,6 +425,173 @@ class CheckCSRResponse(BaseModel):
     identifiers: list[CSRIdentifierResult] = Field(
         ..., description="Per-identifier results in SAN input order"
     )
+
+
+class RSAJWK(BaseModel):
+    """RSA public key in JWK form (RFC 7517 §6.3).
+
+    Only ``kty``/``n``/``e`` participate in validation; any additional
+    members (``alg``, ``kid``, ...) are accepted and ignored. The
+    base64url/value checks run in the engine and surface as 422.
+    """
+
+    kty: str = Field(..., description="Key type; must be the string 'RSA'")
+    n: str = Field(..., description="RSA modulus, unpadded base64url")
+    e: str = Field(..., description="RSA public exponent, unpadded base64url")
+
+
+class DNS01TXTRecordModel(BaseModel):
+    """A TXT resource record as an ordered list of wire string chunks."""
+
+    type: Literal["TXT"]
+    owner: StrictStr = Field(..., min_length=1, description="Record owner name")
+    chunks: list[StrictStr] = Field(
+        ...,
+        description=(
+            "TXT character-strings in wire order; concatenated in this order "
+            "and compared as one string (a long DNS string is split across "
+            "multiple <=255-octet chunks)"
+        ),
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _norm_owner(cls, v: str) -> str:
+        return normalize_name(v, field="owner", allow_underscore=True)
+
+
+class DNS01CNAMERecordModel(BaseModel):
+    """A CNAME resource record for the DNS-01 offline view."""
+
+    type: Literal["CNAME"]
+    owner: StrictStr = Field(..., min_length=1, description="Record owner name")
+    target: StrictStr = Field(..., min_length=1, description="CNAME target name")
+
+    @field_validator("owner")
+    @classmethod
+    def _norm_owner(cls, v: str) -> str:
+        return normalize_name(v, field="owner", allow_underscore=True)
+
+    @field_validator("target")
+    @classmethod
+    def _norm_target(cls, v: str) -> str:
+        return normalize_name(v, field="target", allow_underscore=True)
+
+
+DNS01Record = Union[DNS01TXTRecordModel, DNS01CNAMERecordModel]
+
+
+class DNS01Challenge(BaseModel):
+    """One ACME DNS-01 challenge to verify offline."""
+
+    id: StrictStr = Field(..., min_length=1, description="Caller-chosen unique id")
+    domain: StrictStr = Field(
+        ...,
+        description=(
+            "Challenge domain without the '*' marker; the lookup owner is "
+            "_acme-challenge.<domain> for both wildcard and non-wildcard "
+            "challenges"
+        ),
+    )
+    wildcard: StrictBool = Field(
+        False, description="Whether the challenge authorizes a wildcard name"
+    )
+    token: StrictStr = Field(
+        ..., description="ACME challenge token: non-empty, unpadded base64url"
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _non_blank_id(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("id must not be blank")
+        return v
+
+    @field_validator("domain")
+    @classmethod
+    def _norm_domain(cls, v: str) -> str:
+        return normalize_name(v, field="domain")
+
+
+class CheckDNS01Request(BaseModel):
+    """RSA JWK, 1-20 unique-id DNS-01 challenges and the offline TXT/CNAME view."""
+
+    jwk: RSAJWK
+    challenges: list[DNS01Challenge] = Field(
+        ..., min_length=1, max_length=20, description="1-20 challenges with unique ids"
+    )
+    records: list[DNS01Record] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Up to 100 TXT/CNAME records used as the offline DNS view",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "CheckDNS01Request":
+        ids = [c.id for c in self.challenges]
+        if len(set(ids)) != len(ids):
+            raise ValueError("challenge ids must be unique")
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "jwk": {
+                        "kty": "RSA",
+                        "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+                        "e": "AQAB",
+                    },
+                    "challenges": [
+                        {
+                            "id": "ch1",
+                            "domain": "example.com",
+                            "wildcard": False,
+                            "token": "DGyRejmCefe7v4NfDGDKfA",
+                        }
+                    ],
+                    "records": [
+                        {
+                            "type": "TXT",
+                            "owner": "_acme-challenge.example.com",
+                            "chunks": ["Bs72Q7B-BSSQo4oDjA2qBR07GB6sc3hiG9zqaqvHx7U"],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class DNS01ChallengeResult(BaseModel):
+    """Verification outcome for one challenge, in input order."""
+
+    id: str
+    domain: str = Field(..., description="Normalized domain ('*' never included)")
+    wildcard: bool
+    qname: str = Field(..., description="The exact _acme-challenge.<domain> owner")
+    valid: bool
+    cname_hops: int = Field(..., description="CNAME hops followed (0-8)")
+    cname_chain: list[str] = Field(
+        ..., description="Exact-name chain walked, starting with qname"
+    )
+    txt_owner: str = Field(..., description="Name whose TXT RRs were compared")
+    expected_txt: str = Field(..., description="Required digest, unpadded base64url")
+    observed_txt: list[str] = Field(
+        ..., description="Concatenated chunk strings of every TXT RR at txt_owner"
+    )
+    reason: str
+
+
+class CheckDNS01Response(BaseModel):
+    thumbprint: str = Field(
+        ..., description="RFC 7638 JWK thumbprint, unpadded base64url SHA-256"
+    )
+    valid: bool = Field(
+        ..., description="True only when every challenge verifies"
+    )
+    reason: str
+    results: list[DNS01ChallengeResult]
 
 
 class ImportZoneRequest(BaseModel):
